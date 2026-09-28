@@ -177,10 +177,9 @@ Every calendar day produced by pass 1 is resolved to an instant by
 Pass 2 never calls it: HOURLY/MINUTELY/SECONDLY candidates are always built
 by adding a duration to an already-resolved instant, precisely so that a
 BYMINUTE/BYSECOND expansion cannot reintroduce gap/fold shifting into
-what must stay pure absolute-duration arithmetic (an earlier version of
-this package called `resolveLocal` from the HOURLY path too, and a
-reviewer's probe caught it silently skipping an instant across Sydney's
-October spring-forward — see `timestep.go`'s doc comment).
+what must stay pure absolute-duration arithmetic (routing sub-daily steps
+through wall-clock resolution would skip or duplicate instants across a
+transition — see `timestep.go`'s doc comment).
 
 `resolveLocal` locates the specific zone transition nearest the candidate
 using `time.Location`'s `ZoneBounds` (Go 1.19+) rather than assuming one is
@@ -195,15 +194,12 @@ is always the pre-gap one, since DST by definition only ever adds time. This
 also handles Pacific/Apia's 2011-12-30, a transition that skips an entire
 day rather than an hour, the same way — see `TestApiaSkippedDayRule`.
 
-An earlier version of `resolveLocal` instead always reinterpreted the wall
-clock with whatever offset was in effect about a day earlier, which handled
-a transition's own day correctly but wrongly re-shifted ordinary,
-unambiguous times on the days around it (a reviewer's probe: DTSTART
-2024-03-08 02:30 America/New_York, DAILY, COUNT=4 — the 4th occurrence,
-2024-03-11 02:30, an ordinary EDT time the day after the transition, came
-out as 03:30). `TestDailySweepAroundTransitions` and `TestDailyAtGapOrFoldHour`
-in `dst_sweep_test.go` check a week either side of 8 real transitions across
-5 zones specifically to catch a regression of that shape again.
+Resolving by a fixed lookback (for example, "use the offset in effect a day
+earlier") gets the transition day right but mis-shifts ordinary times on the
+days around it — 2024-03-11 02:30 America/New_York would come out as 03:30.
+`TestDailySweepAroundTransitions` and `TestDailyAtGapOrFoldHour` in
+`dst_sweep_test.go` check a week either side of 8 real transitions across
+5 zones to guard against that class of error.
 
 ## Limitations
 
