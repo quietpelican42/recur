@@ -47,9 +47,10 @@ func TestResolveLocalCheck(t *testing.T) {
 		// 2015-03-22, so 00:00-00:59 local do not exist that day.
 		// Interpreting 00:30 with the pre-gap offset (+03:30) gives
 		// UTC instant 2015-03-21T21:00:00Z, which is 01:30 +04:30
-		// local — 30 minutes after the (60-minute) gap, matching
-		// "one hour after 1:30 A.M. EST" in the RFC's own NY example.
-		{"Tehran gap, 30-minute offset step", 2015, 3, 22, 0, 30, 0, tehran, "2015-03-22T01:30:00+04:30"},
+		// local — one hour after 00:30, the width of the gap, exactly
+		// matching "one hour after 1:30 A.M. EST" in the RFC's own NY
+		// example.
+		{"Tehran gap, offset changes by a full hour (+03:30 to +04:30)", 2015, 3, 22, 0, 30, 0, tehran, "2015-03-22T01:30:00+04:30"},
 		{"Apia skipped day", 2011, 12, 30, 12, 0, 0, apia, "2011-12-31T12:00:00+14:00"},
 	}
 	for _, c := range cases {
@@ -63,73 +64,102 @@ func TestResolveLocalCheck(t *testing.T) {
 	}
 }
 
+// checkRFC3339Sequence asserts got matches want exactly, formatting both as
+// RFC3339 for readable diffs. want is always written as independent literal
+// strings, deliberately never computed by calling resolveLocal or any other
+// function under test — a expectation built the same way as the code being
+// checked cannot catch a shared bug. This is not a hypothetical: an earlier
+// version of TestVerifiedPremiseReproductions built its "want" slice with
+// resolveLocal itself, so it kept passing across a resolveLocal regression
+// that a reviewer's independent probe caught (see below).
+func checkRFC3339Sequence(t *testing.T, got []time.Time, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d occurrences, want %d\n got:  %v\n want: %v", len(got), len(want), formatTimes(got), want)
+	}
+	for i, w := range want {
+		if got[i].Format(time.RFC3339) != w {
+			t.Errorf("occurrence %d = %s, want %s", i, got[i].Format(time.RFC3339), w)
+		}
+	}
+}
+
 // TestVerifiedPremiseReproductions re-runs, through the public Rule API,
-// the two failure modes this package was written to fix (confirmed against
-// teambition/rrule-go v1.8.2 before writing any code here):
+// the failure modes this package was written to fix (confirmed against
+// teambition/rrule-go v1.8.2 before writing any code here), plus the two
+// regressions a reviewer's independent probe found in the first
+// implementation of resolveLocal (a fixed ~26h lookback window, which wrongly
+// re-applied the pre-transition offset to any candidate merely close in time
+// to some transition, whether or not that candidate was itself ambiguous):
 //
 //  1. DAILY, DTSTART 2024-03-08 02:30 America/New_York, COUNT=4: rrule-go
 //     emits 2024-03-10 01:30 EST (wall time moving backward through the
-//     spring-forward gap). RFC 5545 §3.3.5 requires 03:30 EDT.
-//  2. HOURLY, DTSTART 2024-10-06 00:00 Australia/Sydney: rrule-go emits
-//     03:00 AEDT twice (the same instant counted as two occurrences) across
-//     the spring-forward gap (teambition/rrule-go issue #63).
+//     spring-forward gap) instead of the RFC 5545 §3.3.5-correct 03:30 EDT.
+//     Regression: the naive lookback fix also wrongly shifted 2024-03-11
+//     02:30 — an ordinary, unambiguous EDT time the day after the
+//     transition — to 03:30 EDT.
+//  2. DAILY, DTSTART 2024-11-02 01:30 America/New_York, COUNT=3, crossing
+//     the fall-back: 11-03 01:30 must be the fold's first (EDT) occurrence,
+//     and 11-04 01:30 — the day after the fold, ordinary and unambiguous —
+//     must come back to plain 01:30 EST, not drift to 00:30 EST.
+//  3. HOURLY, DTSTART 2024-10-06 00:00 Australia/Sydney, COUNT=5/6: rrule-go
+//     emits 03:00 AEDT twice (the same instant counted as two occurrences)
+//     across the spring-forward gap (teambition/rrule-go issue #63).
+//     Regression: an HOURLY path that re-derives each candidate from wall-
+//     clock components via resolveLocal (instead of pure Add arithmetic)
+//     can skip 03:00 AEDT entirely rather than duplicate it.
 func TestVerifiedPremiseReproductions(t *testing.T) {
-	ny, _ := time.LoadLocation("America/New_York")
-	syd, err := time.LoadLocation("Australia/Sydney")
-	if err != nil {
+	if _, err := time.LoadLocation("America/New_York"); err != nil {
+		t.Skipf("America/New_York tzdata not available: %v", err)
+	}
+	if _, err := time.LoadLocation("Australia/Sydney"); err != nil {
 		t.Skipf("Australia/Sydney tzdata not available: %v", err)
 	}
 
-	t.Run("DAILY across NY spring-forward", func(t *testing.T) {
+	t.Run("DAILY across NY spring-forward, day after is not re-shifted", func(t *testing.T) {
 		r, err := Parse("DTSTART;TZID=America/New_York:20240308T023000\nRRULE:FREQ=DAILY;COUNT=4")
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := r.All(4)
-		want := []time.Time{
-			resolveLocal(2024, 3, 8, 2, 30, 0, ny),
-			resolveLocal(2024, 3, 9, 2, 30, 0, ny),
-			resolveLocal(2024, 3, 10, 2, 30, 0, ny), // nonexistent -> shifted to 03:30 EDT
-			resolveLocal(2024, 3, 11, 2, 30, 0, ny),
-		}
-		if len(got) != len(want) {
-			t.Fatalf("got %d occurrences, want %d: %v", len(got), len(want), got)
-		}
-		for i := range want {
-			if !got[i].Equal(want[i]) {
-				t.Errorf("occurrence %d = %s, want %s", i, got[i].Format(time.RFC3339), want[i].Format(time.RFC3339))
-			}
-		}
-		if got[2].Format(time.RFC3339) != "2024-03-10T03:30:00-04:00" {
-			t.Errorf("occurrence 2 = %s, want 2024-03-10T03:30:00-04:00 (the RFC-correct shift, not rrule-go's 01:30 EST)", got[2].Format(time.RFC3339))
-		}
+		checkRFC3339Sequence(t, r.All(4), []string{
+			"2024-03-08T02:30:00-05:00",
+			"2024-03-09T02:30:00-05:00",
+			"2024-03-10T03:30:00-04:00", // nonexistent -> shifted past the gap
+			"2024-03-11T02:30:00-04:00", // ordinary EDT day after: NOT 03:30
+		})
 	})
 
-	t.Run("HOURLY across Sydney spring-forward, no duplicate", func(t *testing.T) {
+	t.Run("DAILY across NY fall-back, day after is not drifted", func(t *testing.T) {
+		r, err := Parse("DTSTART;TZID=America/New_York:20241102T013000\nRRULE:FREQ=DAILY;COUNT=3")
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkRFC3339Sequence(t, r.All(3), []string{
+			"2024-11-02T01:30:00-04:00",
+			"2024-11-03T01:30:00-04:00", // ambiguous -> first (EDT) occurrence
+			"2024-11-04T01:30:00-05:00", // ordinary EST day after: NOT 00:30
+		})
+	})
+
+	t.Run("HOURLY across Sydney spring-forward, no duplicate and no skip", func(t *testing.T) {
 		r, err := Parse("DTSTART;TZID=Australia/Sydney:20241006T000000\nRRULE:FREQ=HOURLY;COUNT=6")
 		if err != nil {
 			t.Fatal(err)
 		}
 		got := r.All(6)
-		want := []time.Time{
-			resolveLocal(2024, 10, 6, 0, 0, 0, syd),
-			resolveLocal(2024, 10, 6, 1, 0, 0, syd),
+		checkRFC3339Sequence(t, got, []string{
+			"2024-10-06T00:00:00+10:00",
+			"2024-10-06T01:00:00+10:00",
 			// 02:00-02:59 AEST do not exist; the absolute-duration
-			// step from 01:00 lands exactly on 03:00 AEDT once,
-			// not twice.
-			resolveLocal(2024, 10, 6, 3, 0, 0, syd),
-			resolveLocal(2024, 10, 6, 4, 0, 0, syd),
-			resolveLocal(2024, 10, 6, 5, 0, 0, syd),
-			resolveLocal(2024, 10, 6, 6, 0, 0, syd),
-		}
-		if len(got) != len(want) {
-			t.Fatalf("got %d occurrences, want %d: %v", len(got), len(want), got)
-		}
-		for i := range want {
-			if !got[i].Equal(want[i]) {
-				t.Errorf("occurrence %d = %s, want %s", i, got[i].Format(time.RFC3339), want[i].Format(time.RFC3339))
-			}
-		}
+			// step from 01:00 lands exactly on 03:00 AEDT once, not
+			// twice, and 03:00 AEDT must actually appear (a
+			// resolveLocal-based HOURLY path regressed this to
+			// skipping straight to 04:00).
+			"2024-10-06T03:00:00+11:00",
+			"2024-10-06T04:00:00+11:00",
+			"2024-10-06T05:00:00+11:00",
+			"2024-10-06T06:00:00+11:00",
+		})
 		seen := make(map[time.Time]bool)
 		for _, g := range got {
 			if seen[g] {

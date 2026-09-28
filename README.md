@@ -172,14 +172,38 @@ description of the BYxxx evaluation order:
    — never by incrementing a wall-clock field — so a DST transition can
    neither duplicate nor skip a step (see `timestep.go`).
 
-Every calendar day produced by either pass is resolved to an instant by
-`resolveLocal` (`resolve.go`), which reproduces RFC 5545 §3.3.5 exactly: it
-finds the UTC offset in effect shortly before the candidate wall-clock time
-and interprets the wall clock with that offset, which is a no-op for an
-ordinary time, shifts a nonexistent (spring-forward) time past the gap, and
-resolves an ambiguous (fall-back) time to its first occurrence. This also
-handles Pacific/Apia's 2011-12-30, a transition that skips an entire day
-rather than an hour, the same way — see `TestApiaSkippedDayRule`.
+Every calendar day produced by pass 1 is resolved to an instant by
+`resolveLocal` (`resolve.go`), which reproduces RFC 5545 §3.3.5 exactly.
+Pass 2 never calls it: HOURLY/MINUTELY/SECONDLY candidates are always built
+by adding a duration to an already-resolved instant, precisely so that a
+BYMINUTE/BYSECOND expansion cannot reintroduce gap/fold shifting into
+what must stay pure absolute-duration arithmetic (an earlier version of
+this package called `resolveLocal` from the HOURLY path too, and a
+reviewer's probe caught it silently skipping an instant across Sydney's
+October spring-forward — see `timestep.go`'s doc comment).
+
+`resolveLocal` locates the specific zone transition nearest the candidate
+using `time.Location`'s `ZoneBounds` (Go 1.19+) rather than assuming one is
+nearby: it tries the offset in effect at the candidate, and the offsets
+immediately before and after the neighboring transition, keeping whichever
+of those round-trip (interpreting the wall clock with the offset reproduces
+that same offset at the resulting instant). Exactly one round-tripping
+offset is an ordinary, unambiguous time. Two mean an ambiguous (fall-back)
+time — resolved to its first (earlier) occurrence. None mean a nonexistent
+(spring-forward) time — resolved with the smaller of the two offsets, which
+is always the pre-gap one, since DST by definition only ever adds time. This
+also handles Pacific/Apia's 2011-12-30, a transition that skips an entire
+day rather than an hour, the same way — see `TestApiaSkippedDayRule`.
+
+An earlier version of `resolveLocal` instead always reinterpreted the wall
+clock with whatever offset was in effect about a day earlier, which handled
+a transition's own day correctly but wrongly re-shifted ordinary,
+unambiguous times on the days around it (a reviewer's probe: DTSTART
+2024-03-08 02:30 America/New_York, DAILY, COUNT=4 — the 4th occurrence,
+2024-03-11 02:30, an ordinary EDT time the day after the transition, came
+out as 03:30). `TestDailySweepAroundTransitions` and `TestDailyAtGapOrFoldHour`
+in `dst_sweep_test.go` check a week either side of 8 real transitions across
+5 zones specifically to catch a regression of that shape again.
 
 ## Limitations
 

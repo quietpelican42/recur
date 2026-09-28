@@ -3,12 +3,7 @@ package recur
 import "time"
 
 // resolveLocal converts a wall-clock date and time in loc to the instant RFC
-// 5545 §3.3.5 says it denotes, handling the two DST discontinuities that
-// time.Date alone does not resolve consistently (verified against Go
-// 1.27.1: time.Date(2024,3,10,2,30,...,America/New_York) returns
-// 01:30-05:00, silently moving the wall clock backward, while the
-// equivalent Sydney case happens to come out right — the stdlib gives no
-// documented guarantee either way).
+// 5545 §3.3.5 says it denotes.
 //
 // RFC 5545 §3.3.5 (DATE-TIME, FORM #3): "If, based on the definition of the
 // referenced time zone, the local time described occurs more than once
@@ -18,32 +13,108 @@ import "time"
 // time), the DATE-TIME value is interpreted using the UTC offset before the
 // gap in local times." Its own example: TZID=America/New_York:20070311T023000
 // (nonexistent) means "March 11, 2007 at 3:30 A.M. EDT (UTC-04:00), one hour
-// after 1:30 A.M. EST (UTC-05:00)" — the wall clock is shifted forward by
-// the width of the gap, not rolled back into the previous offset.
+// after 1:30 A.M. EST (UTC-05:00)".
 //
-// Both cases reduce to the same rule: interpret the wall-clock components
-// using the UTC offset that was in effect immediately before whatever
-// transition is nearest that wall-clock time, ignoring what offset is
-// actually in effect at the resulting instant. For an ordinary time (no
-// transition within a day either side) that offset is just the correct one
-// and this is a no-op.
+// time.Date alone cannot be used for this: verified against Go 1.27.1,
+// time.Date(2024,3,10,2,30,...,America/New_York) (nonexistent) returns
+// 01:30-05:00, silently moving the wall clock backward instead of shifting
+// it forward past the gap, while the equivalent Australia/Sydney case
+// happens to come out right. Go documents no rule either way, and an
+// earlier version of this function tried to paper over that by always
+// reinterpreting the wall clock with whatever offset was in effect about a
+// day earlier — which is wrong for any ORDINARY (non-transitional) time
+// that merely happens to fall within a day of some unrelated transition: it
+// would incorrectly re-shift already-unambiguous times (caught by the
+// reviewer via DTSTART 2024-03-08 02:30 America/New_York, DAILY, COUNT=4:
+// occurrence 4, 2024-03-11 02:30, is a perfectly ordinary EDT time with
+// nothing before it to resolve, and must not be shifted to 03:30).
+//
+// The approach here instead locates the specific transition nearest the
+// candidate wall-clock time using Location.ZoneBounds (Go 1.19+), and only
+// engages RFC 5545's gap/fold rule when the wall clock actually is
+// nonexistent or ambiguous.
 func resolveLocal(y int, mo time.Month, d, h, mi, s int, loc *time.Location) time.Time {
-	// pivot is a reference point only: the wall-clock numbers themselves
-	// interpreted as if they were already a Unix time. It carries no
-	// meaning beyond letting us add/subtract a candidate offset in
-	// seconds and compare.
-	pivot := time.Date(y, mo, d, h, mi, s, 0, time.UTC).Unix()
+	// wallUTC's only purpose is arithmetic: treating the wall-clock
+	// digits as literal Unix time lets us test "interpret this wall
+	// clock using offset X" as wallUTC.Add(-X seconds), for any offset X,
+	// without reference to any real instant yet.
+	wallUTC := time.Date(y, mo, d, h, mi, s, 0, time.UTC)
 
-	// offsetBefore is the zone offset in effect a bit over a day before
-	// this wall-clock instant. DST transitions are hours wide and, in
-	// every zone in tzdata, at least many days apart, so this reliably
-	// lands before any transition that could make (y,mo,d,h,mi,s)
-	// ambiguous or nonexistent — including a whole day being skipped, as
-	// in Pacific/Apia's 2011-12-30.
-	const probe = 26 * 3600
-	_, offsetBefore := time.Unix(pivot-probe, 0).In(loc).Zone()
+	// guess is Go's own best-effort construction. Per the doc comment
+	// above, its wall-clock display can be wrong across a transition —
+	// but as an instant, it always lands within one DST delta of the
+	// true target, which puts it in a zone segment immediately
+	// neighboring the transition we actually care about (confirmed
+	// against both the New_York and Sydney cases above). We only use it
+	// to find that segment, via ZoneBounds, never as the answer itself.
+	guess := time.Date(y, mo, d, h, mi, s, 0, loc)
+	segStart, segEnd := guess.ZoneBounds()
+	_, curOff := guess.Zone()
 
-	// Interpreting the wall clock with offsetBefore: UTC = local - offset.
-	candidate := time.Unix(pivot-int64(offsetBefore), 0)
-	return candidate.In(loc)
+	// tryOffset reports whether interpreting the wall clock with off
+	// produces a self-consistent instant: one where off is genuinely the
+	// offset in effect at the result. If so, that instant is a valid
+	// reading of the wall clock; if not, off does not apply here at all
+	// (the wall clock is on the other side of a transition from off).
+	tryOffset := func(off int) (time.Time, bool) {
+		c := wallUTC.Add(-time.Duration(off) * time.Second)
+		_, actual := c.In(loc).Zone()
+		return c, actual == off
+	}
+
+	offsets := []int{curOff}
+	if !segStart.IsZero() {
+		_, before := segStart.Add(-time.Second).Zone()
+		offsets = append(offsets, before)
+	}
+	if !segEnd.IsZero() {
+		_, after := segEnd.Zone()
+		offsets = append(offsets, after)
+	}
+
+	seen := make(map[int]bool, len(offsets))
+	var valid []time.Time
+	for _, off := range offsets {
+		if seen[off] {
+			continue
+		}
+		seen[off] = true
+		if c, ok := tryOffset(off); ok {
+			valid = append(valid, c)
+		}
+	}
+
+	switch len(valid) {
+	case 1:
+		// Ordinary case: exactly one offset among the candidates in
+		// this neighborhood produces a genuine instant. This covers
+		// every wall-clock time that isn't itself in a gap or fold,
+		// including one that merely falls near (but not in) a
+		// transition.
+		return valid[0].In(loc)
+	case 2:
+		// Fold: the wall clock is reached twice. RFC 5545 says to use
+		// its first (earlier) occurrence.
+		if valid[0].Before(valid[1]) {
+			return valid[0].In(loc)
+		}
+		return valid[1].In(loc)
+	default:
+		// Gap: none of the candidate offsets round-trip, so the wall
+		// clock does not exist. RFC 5545 says to use the offset in
+		// effect before the gap. A gap is, by definition, a forward
+		// jump in local time (DST always adds time relative to
+		// standard time, and Pacific/Apia's 2011-12-30 whole-day skip
+		// is the same kind of forward jump at a larger scale), so the
+		// pre-gap offset is always the smaller of the (at most two,
+		// after dedup) distinct offsets found near this wall clock.
+		off := offsets[0]
+		for _, o := range offsets[1:] {
+			if o < off {
+				off = o
+			}
+		}
+		c, _ := tryOffset(off)
+		return c.In(loc)
+	}
 }

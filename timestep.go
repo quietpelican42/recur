@@ -65,11 +65,23 @@ func passesDateLimits(y int, mo time.Month, d int, r *Rule) bool {
 }
 
 // hourlyStepCandidates returns the occurrences the hour-period starting at
-// instant contributes.
+// instant contributes. Every candidate is built by adding a duration to
+// instant — never by reconstructing wall-clock components and resolving
+// them back through resolveLocal — so a BYMINUTE/BYSECOND expansion cannot
+// reintroduce the gap/fold shifting that makes sense for a calendar-based
+// frequency but not for an absolute-duration one (this was exactly the
+// reviewer-reported bug: re-deriving via resolveLocal inside the HOURLY
+// path could skip or duplicate an instant across Sydney's October
+// spring-forward, the same failure mode this stepping was written to
+// avoid). instant.Date()/.Clock() are only ever read here, to know which
+// calendar day/hour/minute/second instant already represents and to
+// compute how far instant sits from the top of its hour or minute — both
+// pure reads with no reinterpretation of the wall clock.
 func hourlyStepCandidates(instant time.Time, r *Rule) []time.Time {
 	loc := instant.Location()
-	y, mo, d := instant.Date()
-	h := instant.Hour()
+	wall := instant.In(loc)
+	y, mo, d := wall.Date()
+	h, curMin, curSec := wall.Clock()
 	if !passesDateLimits(y, mo, d, r) {
 		return nil
 	}
@@ -88,21 +100,24 @@ func hourlyStepCandidates(instant time.Time, r *Rule) []time.Time {
 	} else {
 		secs = sortInts(secs)
 	}
+	hourStart := instant.Add(-time.Duration(curMin)*time.Minute - time.Duration(curSec)*time.Second)
 	var out []time.Time
 	for _, mi := range mins {
 		for _, s := range secs {
-			out = append(out, resolveLocal(y, mo, d, h, mi, s, loc))
+			out = append(out, hourStart.Add(time.Duration(mi)*time.Minute+time.Duration(s)*time.Second))
 		}
 	}
 	return applySetPos(out, r.BySetPos)
 }
 
 // minutelyStepCandidates returns the occurrences the minute-period starting
-// at instant contributes.
+// at instant contributes. See hourlyStepCandidates for why every candidate
+// is built with Add, never resolveLocal.
 func minutelyStepCandidates(instant time.Time, r *Rule) []time.Time {
 	loc := instant.Location()
-	y, mo, d := instant.Date()
-	h, mi, _ := instant.Clock()
+	wall := instant.In(loc)
+	y, mo, d := wall.Date()
+	h, mi, curSec := wall.Clock()
 	if !passesDateLimits(y, mo, d, r) {
 		return nil
 	}
@@ -118,19 +133,22 @@ func minutelyStepCandidates(instant time.Time, r *Rule) []time.Time {
 	} else {
 		secs = sortInts(secs)
 	}
+	minuteStart := instant.Add(-time.Duration(curSec) * time.Second)
 	var out []time.Time
 	for _, s := range secs {
-		out = append(out, resolveLocal(y, mo, d, h, mi, s, loc))
+		out = append(out, minuteStart.Add(time.Duration(s)*time.Second))
 	}
 	return applySetPos(out, r.BySetPos)
 }
 
 // secondlyStepCandidates returns the (at most one) occurrence the
-// second-period starting at instant contributes.
+// second-period starting at instant contributes. instant is already the
+// exact candidate; only the BYxxx limit checks read its wall-clock form.
 func secondlyStepCandidates(instant time.Time, r *Rule) []time.Time {
 	loc := instant.Location()
-	y, mo, d := instant.Date()
-	h, mi, s := instant.Clock()
+	wall := instant.In(loc)
+	y, mo, d := wall.Date()
+	h, mi, s := wall.Clock()
 	if !passesDateLimits(y, mo, d, r) {
 		return nil
 	}
@@ -143,7 +161,7 @@ func secondlyStepCandidates(instant time.Time, r *Rule) []time.Time {
 	if len(r.BySecond) > 0 && !containsInt(r.BySecond, s) {
 		return nil
 	}
-	out := []time.Time{resolveLocal(y, mo, d, h, mi, s, loc)}
+	out := []time.Time{instant}
 	return applySetPos(out, r.BySetPos)
 }
 
