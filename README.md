@@ -72,7 +72,7 @@ cannot produce a duplicate or a gap by construction (see `TestVerifiedPremiseRep
 ## Installation
 
 ```sh
-go get github.com/__GH_OWNER__/recur
+go get github.com/quietpelican42/recur
 ```
 
 ## Usage

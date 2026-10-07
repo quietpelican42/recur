@@ -1,3 +1,3 @@
-module github.com/__GH_OWNER__/recur
+module github.com/quietpelican42/recur
 
 go 1.23
